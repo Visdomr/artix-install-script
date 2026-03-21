@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Artix + Hyprland installer 2025 – hopefully the last version ==="
-echo "This script will:"
-echo "  - Partition /dev/nvme0n1 (512M EFI + 20G swap + rest root)"
-echo "  - Install base + OpenRC + AMD ucode + Hyprland stack"
-echo "  - Use temporary password: artix123"
+echo "=== Artix + Hyprland installer – conflict-fixed edition ==="
+echo "Partitions: /dev/nvme0n1 p1=512M EFI | p2=20G swap | p3=rest root"
+echo "Temp password: artix123 (change after boot!)"
 echo ""
-echo "THIS WILL ERASE /dev/nvme0n1 COMPLETELY"
+echo "WARNING: WILL ERASE /dev/nvme0n1"
 read -p "Type YES to continue: " confirm
 if [[ "${confirm^^}" != "YES" ]]; then
     echo "Aborted."
@@ -15,74 +13,48 @@ if [[ "${confirm^^}" != "YES" ]]; then
 fi
 
 DISK="/dev/nvme0n1"
+
+# Partitioning
+echo -e "\ncfdisk: delete all → New 512M EFI System → New 20G Linux swap → New rest Linux filesystem → w → q\n"
+cfdisk "$DISK"
+
+partprobe "$DISK" || true
+sleep 4
+
 EFI_PART="${DISK}p1"
 SWAP_PART="${DISK}p2"
 ROOT_PART="${DISK}p3"
 
-# Partitioning guidance
-echo -e "\n=== Partitioning guidance ==="
-echo "In cfdisk do exactly this:"
-echo "1. Delete all existing partitions until free space only"
-echo "2. New → 512M → type → EFI System"
-echo "3. New → 20G  → type → Linux swap"
-echo "4. New → (rest of space) → type → Linux filesystem"
-echo "5. Write changes (w) → confirm → Quit (q)"
-echo ""
-cfdisk "$DISK"
+[[ -b "$ROOT_PART" ]] || { echo "Partitions missing"; lsblk; exit 1; }
 
-echo "Refreshing partition table..."
-partprobe "$DISK" || true
-sleep 4
-
-# Validate partitions exist
-if [[ ! -b "$ROOT_PART" ]]; then
-    echo "Root partition not found. Check with lsblk"
-    lsblk -f
-    exit 1
-fi
-
-# Format
-echo "Formatting partitions..."
 mkfs.fat -F32 -n EFI "$EFI_PART"   || true
 mkswap -L SWAP "$SWAP_PART"        || true
 mkfs.ext4 -F -L ROOT "$ROOT_PART"  || true
 
-# Mount
-mount "$ROOT_PART" /mnt               || { echo "Mount root failed"; exit 1; }
+mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
-mount "$EFI_PART" /mnt/boot           || true
-swapon "$SWAP_PART"                   || true
+mount "$EFI_PART" /mnt/boot
+swapon "$SWAP_PART" || true
 
-# Critical: create /etc early + fix permissions
+# Create /etc early
 mkdir -p /mnt/etc
 chown root:root /mnt/etc
 chmod 755 /mnt/etc
 
-# Generate fstab
-echo "Generating fstab..."
-fstabgen -U /mnt >> /mnt/etc/fstab || {
-    echo "fstabgen failed – trying manual fallback"
-    echo "UUID=$(blkid -s UUID -o value $EFI_PART)  /boot  vfat  defaults  0 2" >> /mnt/etc/fstab
-    echo "UUID=$(blkid -s UUID -o value $ROOT_PART) /      ext4  defaults  0 1" >> /mnt/etc/fstab
-    echo "UUID=$(blkid -s UUID -o value $SWAP_PART) none   swap  defaults  0 0" >> /mnt/etc/fstab
-}
-
+fstabgen -U /mnt >> /mnt/etc/fstab || true
 cat /mnt/etc/fstab
 
-# Base system
-echo "Installing base system..."
+# Base
 basestrap /mnt base base-devel openrc elogind-openrc \
-    linux linux-firmware linux-headers grub efibootmgr \
-    amd-ucode networkmanager-openrc dhcpcd || true
+    linux linux-firmware linux-headers grub efibootmgr amd-ucode \
+    networkmanager-openrc dhcpcd || true
 
 # Chroot
-echo "Entering chroot..."
 artix-chroot /mnt /bin/bash <<'CHROOT' || true
 set -euo pipefail
 
-echo "=== Inside chroot ==="
+echo "=== Chroot ==="
 
-# Basic setup
 HOSTNAME="artix-hyprland"
 echo "$HOSTNAME" > /etc/hostname
 
@@ -99,59 +71,51 @@ echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 echo 'LANG=en_US.UTF-8' > /etc/locale.conf
 
-# Passwords – root first
-echo "root:artix123" | chpasswd || echo "root password failed – try manually later"
+echo "root:artix123" | chpasswd || true
 
-read -r -p "Your username: " USERNAME
+read -r -p "Your username: " USER
 
-# User creation – ignore PAM error
-useradd -m -G wheel,video,input,audio,storage "$USERNAME" || true
-echo "$USERNAME:artix123" | chpasswd || echo "User password step failed – try passwd after boot"
+useradd -m -G wheel,video,input,audio,storage "$USER" || true
+echo "$USER:artix123" | chpasswd || true
 
 echo "%wheel ALL=(ALL:ALL) ALL" | EDITOR='tee -a' visudo
 
-# Bootloader
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || true
 grub-mkconfig -o /boot/grub/grub.cfg || true
 
-# Packages
+# Fix conflict: remove old xorg-server-common if present
+pacman -Rdd --noconfirm xorg-server-common || true
+
+# Install packages – split to avoid conflict
 pacman -S --noconfirm --needed mesa vulkan-radeon vulkan-intel \
-    networkmanager networkmanager-openrc \
+    networkmanager networkmanager-openrc bluez bluez-openrc blueman \
     pipewire pipewire-openrc pipewire-alsa pipewire-pulse wireplumber wireplumber-openrc \
-    hyprland xdg-desktop-portal-hyprland waybar hyprpaper hyprlock hypridle \
-    mako fuzzel qt5-wayland qt6-wayland polkit-gnome grim slurp wl-clipboard \
-    brightnessctl pavucontrol ttf-jetbrains-mono-nerd noto-fonts ttf-font-awesome \
-    alacritty thunar firefox blueman bluez bluez-openrc || true
+    qt5-wayland qt6-wayland polkit-gnome grim slurp wl-clipboard brightnessctl pavucontrol \
+    ttf-jetbrains-mono-nerd noto-fonts ttf-font-awesome alacritty thunar firefox || true
+
+pacman -S --noconfirm --overwrite '*' hyprland xdg-desktop-portal-hyprland \
+    waybar hyprpaper hyprlock hypridle mako fuzzel || true
 
 rc-update add NetworkManager default bluetoothd default dbus default || true
 
-su - "$USERNAME" -c "rc-update --user add pipewire default"   || true
-su - "$USERNAME" -c "rc-update --user add wireplumber default" || true
+su - "$USER" -c "rc-update --user add pipewire default"   || true
+su - "$USER" -c "rc-update --user add wireplumber default" || true
 
-# Optional SDDM
-read -p "Install SDDM login manager? [y/N]: " sddm
+read -p "Install SDDM? [y/N] " sddm
 if [[ "$sddm" =~ ^[Yy]$ ]]; then
     pacman -S --noconfirm sddm sddm-openrc || true
     rc-update add sddm default || true
 else
-    echo '[[ -z $DISPLAY && $(tty) = /dev/tty1 ]] && exec Hyprland' >> /home/"$USERNAME"/.bash_profile
+    echo '[[ -z $DISPLAY && $(tty) = /dev/tty1 ]] && exec Hyprland' >> /home/"$USER"/.bash_profile
 fi
 
-chown -R "$USERNAME:$USERNAME" /home/"$USERNAME" || true
+chown -R "$USER:$USER" /home/"$USER" || true
 
-echo ""
-echo "========================================"
-echo "Installation reached the end."
-echo "Temporary password: artix123"
-echo "Commands to finish:"
-echo "  exit"
-echo "  umount -R /mnt"
-echo "  swapoff -a"
-echo "  reboot"
-echo ""
-echo "After boot → login → passwd (your user) → sudo passwd (root)"
-echo "========================================"
+echo "=== FINISHED ==="
+echo "Temp pass artix123 for root and $USER"
+echo "exit → umount -R /mnt && swapoff -a && reboot"
+echo "After boot: passwd && sudo passwd"
 CHROOT
 
-echo "Script finished (or chroot exited). Now run:"
+echo "Script done. Now:"
 echo "umount -R /mnt && swapoff -a && reboot"
