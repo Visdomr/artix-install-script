@@ -8,28 +8,28 @@ echo ""
 # ───────────────────────────────────────────────
 #  Phase 0 — Networking (same as before)
 # ───────────────────────────────────────────────
-echo "=== Step 0: Networking ==="
-ip -c link show
-echo ""
-read -p "Wired interface (e.g. enp3s0) or press Enter for Wi-Fi → " WIRED_IFACE
+#echo "=== Step 0: Networking ==="
+#ip -c link show
+#echo ""
+#read -p "Wired interface (e.g. enp3s0) or press Enter for Wi-Fi → " WIRED_IFACE
 
-if [[ -n "$WIRED_IFACE" ]]; then
-    dhcpcd "$WIRED_IFACE" || true
-else
-    echo "Wi-Fi mode"
-    read -p "Wireless interface (usually wlan0) → " WLAN_IFACE
-    : "${WLAN_IFACE:=wlan0}"
-    rfkill unblock wifi || true
-    ip link set "$WLAN_IFACE" up || true
-    connmanctl enable wifi 2>/dev/null || true
-    connmanctl scan wifi
-    echo ""
-    connmanctl services
-    echo ""
-    read -p "Copy-paste FULL service name (wifi_...) → " SERVICE
-    connmanctl agent on
-    connmanctl connect "$SERVICE"
-fi
+#if [[ -n "$WIRED_IFACE" ]]; then
+    #dhcpcd "$WIRED_IFACE" || true
+#else
+    #echo "Wi-Fi mode"
+    #read -p "Wireless interface (usually wlan0) → " WLAN_IFACE
+    #: "${WLAN_IFACE:=wlan0}"
+    #rfkill unblock wifi || true
+    #ip link set "$WLAN_IFACE" up || true
+    #connmanctl enable wifi 2>/dev/null || true
+    #connmanctl scan wifi
+    #echo ""
+    #connmanctl services
+    #echo ""
+    #read -p "Copy-paste FULL service name (wifi_...) → " SERVICE
+    #connmanctl agent on
+    #connmanctl connect "$SERVICE"
+#fi
 
 echo -n "Testing internet... "
 ping -c 1 -W 4 8.8.8.8 &>/dev/null && echo "OK" || { echo "FAILED"; exit 1; }
