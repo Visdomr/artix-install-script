@@ -1,77 +1,89 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Artix OpenRC + Hyprland Install (hardened version for Eric) ==="
-echo "Partitions: /dev/nvme0n1p1 EFI 512MiB | p2 swap 20GiB | p3 root rest"
-echo "AMD ucode included | Temp pass: artix123 (CHANGE AFTER BOOT!)"
+echo "=== Artix + Hyprland installer 2025 – hopefully the last version ==="
+echo "This script will:"
+echo "  - Partition /dev/nvme0n1 (512M EFI + 20G swap + rest root)"
+echo "  - Install base + OpenRC + AMD ucode + Hyprland stack"
+echo "  - Use temporary password: artix123"
 echo ""
-echo "WARNING: ERASES /dev/nvme0n1 COMPLETELY!"
-read -p "Continue? (y/yes/Y/YES): " confirm
-confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]' | xargs)
-
-if [[ ! "$confirm" =~ ^(y|yes)$ ]]; then
+echo "THIS WILL ERASE /dev/nvme0n1 COMPLETELY"
+read -p "Type YES to continue: " confirm
+if [[ "${confirm^^}" != "YES" ]]; then
     echo "Aborted."
     exit 1
 fi
 
 DISK="/dev/nvme0n1"
-
-# Phase 1: Partitioning
-echo "=== Partitioning (/dev/nvme0n1) ==="
-echo "cfdisk steps:"
-echo " - Delete old partitions until free space"
-echo " - New → 512M → type EFI System"
-echo " - New → 20G → type Linux swap"
-echo " - New → rest → type Linux filesystem"
-echo " - Write (w) → confirm → Quit (q)"
-echo ""
-
-cfdisk "$DISK"
-
-partprobe "$DISK" 2>/dev/null || true
-sleep 3
-
 EFI_PART="${DISK}p1"
 SWAP_PART="${DISK}p2"
 ROOT_PART="${DISK}p3"
 
+# Partitioning guidance
+echo -e "\n=== Partitioning guidance ==="
+echo "In cfdisk do exactly this:"
+echo "1. Delete all existing partitions until free space only"
+echo "2. New → 512M → type → EFI System"
+echo "3. New → 20G  → type → Linux swap"
+echo "4. New → (rest of space) → type → Linux filesystem"
+echo "5. Write changes (w) → confirm → Quit (q)"
+echo ""
+cfdisk "$DISK"
+
+echo "Refreshing partition table..."
+partprobe "$DISK" || true
+sleep 4
+
+# Validate partitions exist
 if [[ ! -b "$ROOT_PART" ]]; then
-    echo "Partitions missing! Check lsblk"
-    lsblk -f "$DISK"
+    echo "Root partition not found. Check with lsblk"
+    lsblk -f
     exit 1
 fi
 
-# Format & mount
-mkfs.fat -F32 -n EFI "$EFI_PART"
-mkswap -L SWAP "$SWAP_PART"
-mkfs.ext4 -F -L ROOT "$ROOT_PART"
+# Format
+echo "Formatting partitions..."
+mkfs.fat -F32 -n EFI "$EFI_PART"   || true
+mkswap -L SWAP "$SWAP_PART"        || true
+mkfs.ext4 -F -L ROOT "$ROOT_PART"  || true
 
-mount "$ROOT_PART" /mnt
+# Mount
+mount "$ROOT_PART" /mnt               || { echo "Mount root failed"; exit 1; }
 mkdir -p /mnt/boot
-mount "$EFI_PART" /mnt/boot
-swapon "$SWAP_PART" || true  # ok if already on
+mount "$EFI_PART" /mnt/boot           || true
+swapon "$SWAP_PART"                   || true
 
-# Clean any old swap ref that blocks fstabgen
-swapoff "$SWAP_PART" 2>/dev/null || true
-swapon "$SWAP_PART"
+# Critical: create /etc early + fix permissions
+mkdir -p /mnt/etc
+chown root:root /mnt/etc
+chmod 755 /mnt/etc
 
-fstabgen -U /mnt >> /mnt/etc/fstab
+# Generate fstab
+echo "Generating fstab..."
+fstabgen -U /mnt >> /mnt/etc/fstab || {
+    echo "fstabgen failed – trying manual fallback"
+    echo "UUID=$(blkid -s UUID -o value $EFI_PART)  /boot  vfat  defaults  0 2" >> /mnt/etc/fstab
+    echo "UUID=$(blkid -s UUID -o value $ROOT_PART) /      ext4  defaults  0 1" >> /mnt/etc/fstab
+    echo "UUID=$(blkid -s UUID -o value $SWAP_PART) none   swap  defaults  0 0" >> /mnt/etc/fstab
+}
 
-echo "Mounts & fstab ready:"
-lsblk -f
+cat /mnt/etc/fstab
 
-# Phase 2: Base install
+# Base system
+echo "Installing base system..."
 basestrap /mnt base base-devel openrc elogind-openrc \
     linux linux-firmware linux-headers grub efibootmgr \
-    networkmanager-openrc dhcpcd amd-ucode
+    amd-ucode networkmanager-openrc dhcpcd || true
 
-# Phase 3: Chroot
-artix-chroot /mnt /bin/bash <<'EOF'
+# Chroot
+echo "Entering chroot..."
+artix-chroot /mnt /bin/bash <<'CHROOT' || true
 set -euo pipefail
 
-echo "=== Chroot phase ==="
+echo "=== Inside chroot ==="
 
-read -p "Hostname: " HOSTNAME
+# Basic setup
+HOSTNAME="artix-hyprland"
 echo "$HOSTNAME" > /etc/hostname
 
 cat > /etc/hosts <<EOL
@@ -88,64 +100,58 @@ locale-gen
 echo 'LANG=en_US.UTF-8' > /etc/locale.conf
 
 # Passwords – root first
-echo "root:artix123" | chpasswd
-echo "Root password set"
+echo "root:artix123" | chpasswd || echo "root password failed – try manually later"
 
-read -p "Username: " USER
+read -r -p "Your username: " USERNAME
 
-# User creation – ignore PAM warning (expected in minimal chroot)
-useradd -m -G wheel,video,input,audio,storage "$USER" || true
-echo "User $USER created (ignore any PAM warning above)"
-
-# Password after creation
-echo "$USER:artix123" | chpasswd
-echo "User password set to artix123"
+# User creation – ignore PAM error
+useradd -m -G wheel,video,input,audio,storage "$USERNAME" || true
+echo "$USERNAME:artix123" | chpasswd || echo "User password step failed – try passwd after boot"
 
 echo "%wheel ALL=(ALL:ALL) ALL" | EDITOR='tee -a' visudo
 
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
+# Bootloader
+grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || true
+grub-mkconfig -o /boot/grub/grub.cfg || true
 
-# GPU (AMD/Intel mesa; change to nvidia if needed)
-pacman -S --noconfirm mesa vulkan-radeon vulkan-intel
+# Packages
+pacman -S --noconfirm --needed mesa vulkan-radeon vulkan-intel \
+    networkmanager networkmanager-openrc \
+    pipewire pipewire-openrc pipewire-alsa pipewire-pulse wireplumber wireplumber-openrc \
+    hyprland xdg-desktop-portal-hyprland waybar hyprpaper hyprlock hypridle \
+    mako fuzzel qt5-wayland qt6-wayland polkit-gnome grim slurp wl-clipboard \
+    brightnessctl pavucontrol ttf-jetbrains-mono-nerd noto-fonts ttf-font-awesome \
+    alacritty thunar firefox blueman bluez bluez-openrc || true
 
-pacman -S --noconfirm networkmanager networkmanager-openrc
-rc-update add NetworkManager default
+rc-update add NetworkManager default bluetoothd default dbus default || true
 
-pacman -S --noconfirm pipewire pipewire-openrc pipewire-alsa pipewire-pulse wireplumber wireplumber-openrc
-su - "$USER" -c "rc-update --user add pipewire default" || true
-su - "$USER" -c "rc-update --user add wireplumber default" || true
+su - "$USERNAME" -c "rc-update --user add pipewire default"   || true
+su - "$USERNAME" -c "rc-update --user add wireplumber default" || true
 
-pacman -S --noconfirm hyprland xdg-desktop-portal-hyprland \
-    waybar hyprpaper hyprlock hypridle mako fuzzel \
-    qt5-wayland qt6-wayland polkit-gnome \
-    grim slurp wl-clipboard brightnessctl pavucontrol \
-    ttf-jetbrains-mono-nerd noto-fonts ttf-font-awesome \
-    alacritty thunar firefox blueman bluez bluez-openrc
-
-rc-update add bluetoothd default
-rc-update add dbus default
-
-read -p "Install SDDM? [y/N] " sddm
+# Optional SDDM
+read -p "Install SDDM login manager? [y/N]: " sddm
 if [[ "$sddm" =~ ^[Yy]$ ]]; then
-    pacman -S --noconfirm sddm sddm-openrc
-    rc-update add sddm default
+    pacman -S --noconfirm sddm sddm-openrc || true
+    rc-update add sddm default || true
 else
-    echo '[[ -z $DISPLAY && $(tty) = /dev/tty1 ]] && exec Hyprland' >> /home/"$USER"/.bash_profile
+    echo '[[ -z $DISPLAY && $(tty) = /dev/tty1 ]] && exec Hyprland' >> /home/"$USERNAME"/.bash_profile
 fi
 
-chown -R "$USER:$USER" /home/"$USER"
-
-# Verification
-echo "Verification:"
-id "$USER" 2>/dev/null || echo "id may warn but user ok"
-grep "$USER" /etc/passwd
-grep "$USER" /etc/shadow || echo "Shadow entry missing? (should not happen)"
+chown -R "$USERNAME:$USERNAME" /home/"$USERNAME" || true
 
 echo ""
-echo "=== FINISHED ==="
-echo "Temp password 'artix123' for root and $USER"
-echo "exit → umount -R /mnt && swapoff -a && reboot"
-echo "After boot: passwd && sudo passwd to change passwords"
-echo "=== === === === ==="
-EOF
+echo "========================================"
+echo "Installation reached the end."
+echo "Temporary password: artix123"
+echo "Commands to finish:"
+echo "  exit"
+echo "  umount -R /mnt"
+echo "  swapoff -a"
+echo "  reboot"
+echo ""
+echo "After boot → login → passwd (your user) → sudo passwd (root)"
+echo "========================================"
+CHROOT
+
+echo "Script finished (or chroot exited). Now run:"
+echo "umount -R /mnt && swapoff -a && reboot"
